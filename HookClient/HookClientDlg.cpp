@@ -5,16 +5,30 @@
 #include "pch.h"
 #include "framework.h"
 #include "HookClient.h"
-#include "HookClientDlg.h"
 #include "afxdialogex.h"
 #include "PopupDlg.h"
 #include <winsvc.h>			//加载驱动的服务
 #include <winioctl.h>		//IOCTRL API 
 
+#include <winioctl.h>
+#include <crtdbg.h>
+#include <assert.h>
+#include <fltUser.h>
+
+#include <dontuse.h>
+#include "HookClientDlg.h"
+
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
 #define IOCTL_SEND_RESULT_TO_R0 (ULONG) CTL_CODE(FILE_DEVICE_UNKNOWN, 0x8001, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+
+#define SCANNER_DEFAULT_REQUEST_COUNT       5
+#define SCANNER_DEFAULT_THREAD_COUNT        2
+#define SCANNER_MAX_THREAD_COUNT            64
+
+UCHAR FoulString[] = "foul";
 
 
 #define DRIVER_NAME _T("HookDrv")
@@ -25,6 +39,50 @@ HANDLE gh_Device = INVALID_HANDLE_VALUE;
 CWinThread	*g_hReadThread = NULL;
 BOOL	g_bToExitThread = FALSE;
 HANDLE	g_hOverlappedEvent = NULL;
+
+
+#pragma pack(1)
+
+typedef struct _SCANNER_MESSAGE {
+
+	//
+	//  Required structure header.
+	//
+
+	FILTER_MESSAGE_HEADER MessageHeader;
+
+
+	//
+	//  Private scanner-specific fields begin here.
+	//
+
+	SCANNER_NOTIFICATION Notification;
+
+	//
+	//  Overlapped structure: this is not really part of the message
+	//  However we embed it instead of using a separately allocated overlap structure
+	//
+
+	OVERLAPPED Ovlp;
+
+} SCANNER_MESSAGE, *PSCANNER_MESSAGE;
+
+typedef struct _SCANNER_REPLY_MESSAGE {
+
+	//
+	//  Required structure header.
+	//
+
+	FILTER_REPLY_HEADER ReplyHeader;
+
+	//
+	//  Private scanner-specific fields begin here.
+	//
+
+	SCANNER_REPLY Reply;
+
+} SCANNER_REPLY_MESSAGE, *PSCANNER_REPLY_MESSAGE;
+
 
 BOOL LoadDriver(TCHAR* lpszDriverName, TCHAR* lpszDriverPath)
 {
@@ -256,6 +314,215 @@ typedef struct _OP_INFO
 
 } OP_INFO, *POP_INFO;
 
+//与R0通信
+void sendR0Msg(HANDLE port) {
+	HRESULT hr;
+
+	wchar_t OutBuffer[MAX_PATH] = { 0 };
+	DWORD bytesReturned = 0;
+	Data data;
+	data.code = DEFAULT_CODE;
+
+	wchar_t helloMsg[200] = L"Hello R0";
+	printf("sendR0Msg start!\n");
+	wcscpy_s(data.filename, wcslen(helloMsg) + 1, helloMsg);
+
+	printf("FilterSendMessage start!\n");
+	hr = FilterSendMessage(port, &data, sizeof(data), OutBuffer, sizeof(OutBuffer), &bytesReturned);
+
+	if (IS_ERROR(hr)) {
+		printf("FilterSendMessage fail!\n");
+	}
+
+	printf("从内核发来的信息是:%ls\n", OutBuffer);
+}
+
+BOOL
+ScanBuffer(
+	__in_bcount(BufferSize) PUCHAR Buffer,
+	__in ULONG BufferSize
+)
+/*++
+
+Routine Description
+
+	Scans the supplied buffer for an instance of FoulString.
+
+	Note: Pattern matching algorithm used here is just for illustration purposes,
+	there are many better algorithms available for real world filters
+
+Arguments
+
+	Buffer      -   Pointer to buffer
+	BufferSize  -   Size of passed in buffer
+
+Return Value
+
+	TRUE        -    Found an occurrence of the appropriate FoulString
+	FALSE       -    Buffer is ok
+
+--*/
+{
+	PUCHAR p;
+	ULONG searchStringLength = sizeof(FoulString) - sizeof(UCHAR);
+
+	for (p = Buffer;
+		p <= (Buffer + BufferSize - searchStringLength);
+		p++) {
+
+		if (RtlEqualMemory(p, FoulString, searchStringLength)) {
+
+			printf("Found a string\n");
+
+			//
+			//  Once we find our search string, we're not interested in seeing
+			//  whether it appears again.
+			//
+
+			return TRUE;
+		}
+	}
+
+	return FALSE;
+}
+
+
+DWORD
+ScannerWorker(
+	__in PSCANNER_THREAD_CONTEXT Context
+)
+/*++
+
+Routine Description
+
+	This is a worker thread that
+
+
+Arguments
+
+	Context  - This thread context has a pointer to the port handle we use to send/receive messages,
+				and a completion port handle that was already associated with the comm. port by the caller
+
+Return Value
+
+	HRESULT indicating the status of thread exit.
+
+--*/
+{
+	PSCANNER_NOTIFICATION notification;
+	SCANNER_REPLY_MESSAGE replyMessage;
+	PSCANNER_MESSAGE message;
+	LPOVERLAPPED pOvlp;
+	BOOL result;
+	DWORD outSize;
+	HRESULT hr;
+	ULONG_PTR key;
+
+#pragma warning(push)
+#pragma warning(disable:4127) // conditional expression is constant
+
+	while (TRUE) {
+
+#pragma warning(pop)
+
+		//
+		//  Poll for messages from the filter component to scan.
+		//
+
+		result = GetQueuedCompletionStatus(Context->Completion, &outSize, &key, &pOvlp, INFINITE);
+
+		//
+		//  Obtain the message: note that the message we sent down via FltGetMessage() may NOT be
+		//  the one dequeued off the completion queue: this is solely because there are multiple
+		//  threads per single port handle. Any of the FilterGetMessage() issued messages can be
+		//  completed in random order - and we will just dequeue a random one.
+		//
+
+		message = CONTAINING_RECORD(pOvlp, SCANNER_MESSAGE, Ovlp);
+
+		if (!result) {
+
+			//
+			//  An error occured.
+			//
+
+			hr = HRESULT_FROM_WIN32(GetLastError());
+			break;
+		}
+
+		printf("Received message, size %d\n", pOvlp->InternalHigh);
+
+		notification = &message->Notification;
+
+		assert(notification->BytesToScan <= SCANNER_READ_BUFFER_SIZE);
+		__analysis_assume(notification->BytesToScan <= SCANNER_READ_BUFFER_SIZE);
+
+		//这个地方，可以修改成弹窗的代码:result=PopupWindow(notification);
+		result = ScanBuffer(notification->Contents, notification->BytesToScan);
+
+		replyMessage.ReplyHeader.Status = 0;
+		replyMessage.ReplyHeader.MessageId = message->MessageHeader.MessageId;
+
+		//
+		//  Need to invert the boolean -- result is true if found
+		//  foul language, in which case SafeToOpen should be set to false.
+		//
+
+		replyMessage.Reply.SafeToOpen = !result;
+
+		printf("Replying message, SafeToOpen: %d\n", replyMessage.Reply.SafeToOpen);
+
+		hr = FilterReplyMessage(Context->Port,
+			(PFILTER_REPLY_HEADER)&replyMessage,
+			sizeof(replyMessage));
+		//这个时候，执行完上面函数后，驱动中FltSendMessage()返回
+		if (SUCCEEDED(hr)) {
+
+			printf("Replied message\n");
+
+		}
+		else {
+
+			printf("Scanner: Error replying message. Error = 0x%X\n", hr);
+			break;
+		}
+
+		memset(&message->Ovlp, 0, sizeof(OVERLAPPED));
+
+		hr = FilterGetMessage(Context->Port,
+			&message->MessageHeader,
+			FIELD_OFFSET(SCANNER_MESSAGE, Ovlp),
+			&message->Ovlp);
+
+		if (hr != HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
+
+			break;
+		}
+	}
+
+	if (!SUCCEEDED(hr)) {
+
+		if (hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE)) {
+
+			//
+			//  Scanner port disconncted.
+			//
+
+			printf("Scanner: Port is disconnected, probably due to scanner filter unloading.\n");
+
+		}
+		else {
+
+			printf("Scanner: Unknown error occured. Error = 0x%X\n", hr);
+		}
+	}
+
+	free(message);
+
+	return hr;
+}
+
+
 
 VOID  SendResultToR0(ULONG ulWaitID, BOOL bBlocked)
 {
@@ -455,38 +722,168 @@ void CHookClientDlg::OnBnClickedOk()
 {
 	// TODO: Add extra validation here
 
-	DWORD dwThreadID = 0;
-	g_bToExitThread = FALSE;
-	//加载驱动
-	BOOL bRet = LoadDriver(DRIVER_NAME, DRIVER_PATH);
-	if (!bRet)
-	{
-		MessageBox(_T("加载驱动失败"), _T("Error"), MB_OK);
+	//DWORD dwThreadID = 0;
+	//g_bToExitThread = FALSE;
+	////加载驱动
+	//BOOL bRet = LoadDriver(DRIVER_NAME, DRIVER_PATH);
+	//if (!bRet)
+	//{
+	//	MessageBox(_T("加载驱动失败"), _T("Error"), MB_OK);
+	//	return;
+	//}
+
+
+	//gh_Device = OpenDevice();
+	//if (gh_Device == NULL)
+	//{
+	//	MessageBox(_T("打开设备失败"), _T("Error"), MB_OK);
+	//	return;
+	//}
+
+	//g_hReadThread = AfxBeginThread(ReadThreadProc, this);
+
+	//g_hReadThread->SuspendThread();
+	//g_hReadThread->m_bAutoDelete = FALSE;
+	//g_hReadThread->ResumeThread();
+
+
+	//if (g_hReadThread == NULL)
+	//{
+	//	CloseHandle(gh_Device);
+	//	gh_Device = INVALID_HANDLE_VALUE;
+	//	UnloadDriver(DRIVER_NAME);
+	//	return;
+	//}
+
+	DWORD requestCount = SCANNER_DEFAULT_REQUEST_COUNT;
+	DWORD threadCount = SCANNER_DEFAULT_THREAD_COUNT;
+	HANDLE threads[SCANNER_MAX_THREAD_COUNT];
+	SCANNER_THREAD_CONTEXT context;
+	HANDLE port, completion;
+	PSCANNER_MESSAGE msg;
+	DWORD threadId;
+	HRESULT hr;
+	DWORD i, j;
+
+	//
+	//  Check how many threads and per thread requests are desired.
+	//
+
+
+	//
+	//  Open a commuication channel to the filter
+	//
+
+	printf("Scanner: Connecting to the filter ...\n");
+	//链接端口
+	hr = FilterConnectCommunicationPort(ScannerPortName,
+		0,
+		NULL,
+		0,
+		NULL,
+		&port);
+
+	if (IS_ERROR(hr)) {
+
+		printf("ERROR: Connecting to filter port: 0x%08x\n", hr);
 		return;
 	}
 
+	sendR0Msg(port);
 
-	gh_Device = OpenDevice();
-	if (gh_Device == NULL)
-	{
-		MessageBox(_T("打开设备失败"), _T("Error"), MB_OK);
+	//
+	//  Create a completion port to associate with this handle.
+	//
+	//创建与此句柄关联的完成端口
+	completion = CreateIoCompletionPort(port,
+		NULL,
+		0,
+		threadCount);
+
+
+
+	if (completion == NULL) {
+
+		printf("ERROR: Creating completion port: %d\n", GetLastError());
+		CloseHandle(port);
 		return;
 	}
 
-	g_hReadThread = AfxBeginThread(ReadThreadProc, this);
+	printf("Scanner: Port = 0x%p Completion = 0x%p\n", port, completion);
 
-	g_hReadThread->SuspendThread();
-	g_hReadThread->m_bAutoDelete = FALSE;
-	g_hReadThread->ResumeThread();
+	context.Port = port;
+	context.Completion = completion;
 
+	//
+	//  创建明确数量的线程
+	//  Create specified number of threads.
+	//
 
-	if (g_hReadThread == NULL)
-	{
-		CloseHandle(gh_Device);
-		gh_Device = INVALID_HANDLE_VALUE;
-		UnloadDriver(DRIVER_NAME);
-		return;
+	for (i = 0; i < threadCount; i++) {
+
+		threads[i] = CreateThread(NULL,
+			0,
+			(LPTHREAD_START_ROUTINE)ScannerWorker,
+			&context,
+			0,
+			&threadId);
+
+		if (threads[i] == NULL) {
+
+			//
+			//  Couldn't create thread.
+			//
+
+			hr = GetLastError();
+			printf("ERROR: Couldn't create thread: %d\n", hr);
+			goto main_cleanup;
+		}
+
+		for (j = 0; j < requestCount; j++) {
+
+			//
+			//  Allocate the message.
+			//
+
+#pragma prefast(suppress:__WARNING_MEMORY_LEAK, "msg will not be leaked because it is freed in ScannerWorker")
+			msg = (PSCANNER_MESSAGE)malloc(sizeof(SCANNER_MESSAGE));
+
+			if (msg == NULL) {
+
+				hr = ERROR_NOT_ENOUGH_MEMORY;
+				goto main_cleanup;
+			}
+
+			memset(&msg->Ovlp, 0, sizeof(OVERLAPPED));
+
+			//
+			//  Request messages from the filter driver.
+			//
+
+			hr = FilterGetMessage(port,
+				&msg->MessageHeader,
+				FIELD_OFFSET(SCANNER_MESSAGE, Ovlp),
+				&msg->Ovlp);
+
+			if (hr != HRESULT_FROM_WIN32(ERROR_IO_PENDING)) {
+
+				free(msg);
+				goto main_cleanup;
+			}
+		}
 	}
+
+
+	hr = S_OK;
+
+	WaitForMultipleObjectsEx(i, threads, TRUE, INFINITE, FALSE);
+
+main_cleanup:
+
+	printf("Scanner:  All done. Result = 0x%08x\n", hr);
+
+	CloseHandle(port);
+	CloseHandle(completion);
 
 	GetDlgItem(IDOK)->EnableWindow(FALSE);
 	GetDlgItem(IDCANCEL)->EnableWindow(TRUE);
@@ -541,3 +938,29 @@ void CHookClientDlg::OnClose()
 {
 	CDialog::OnCancel();
 }
+
+VOID
+Usage(
+	VOID
+)
+/*++
+
+Routine Description
+
+	Prints usage
+
+Arguments
+
+	None
+
+Return Value
+
+	None
+
+--*/
+{
+
+	printf("Connects to the scanner filter and scans buffers \n");
+	printf("Usage: scanuser [requests per thread] [number of threads(1-64)]\n");
+}
+
