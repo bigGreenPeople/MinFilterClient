@@ -40,7 +40,7 @@ CWinThread	*g_hReadThread = NULL;
 BOOL	g_bToExitThread = FALSE;
 HANDLE	g_hOverlappedEvent = NULL;
 
-
+BOOL  HandleData();
 #pragma pack(1)
 
 typedef struct _SCANNER_MESSAGE {
@@ -459,6 +459,13 @@ Return Value
 
 		//这个地方，可以修改成弹窗的代码:result=PopupWindow(notification);
 		result = ScanBuffer(notification->Contents, notification->BytesToScan);
+		
+		//result = PopupWindow(notification);
+		if (result) {
+			//查询到foul交给用户判断是否阻止
+			result = HandleData();  // 此处可以弹框获得用户的结果
+		}
+		
 
 		replyMessage.ReplyHeader.Status = 0;
 		replyMessage.ReplyHeader.MessageId = message->MessageHeader.MessageId;
@@ -540,13 +547,12 @@ VOID  SendResultToR0(ULONG ulWaitID, BOOL bBlocked)
 
 	return;
 }
-BOOL  HandleData(OP_INFO *pOpInfoData)
+BOOL  HandleData()
 {
 
 	PopupDlg dlg;
 
-	dlg.SetProcess(pOpInfoData->m_ProcessName);
-	dlg.SetDetail(_T("有进程正在非法攻击"));
+	dlg.SetDetail(_T("是否打开存在疑似木马文本?"));
 
 	dlg.DoModal();
 
@@ -565,7 +571,7 @@ void  PopupInfoToUser(OP_INFO *pOpInfo, int Num)
 
 	for (int i = 0; i < Num; i++)
 	{
-		BOOL bResult = HandleData(currData);  // 此处可以弹框获得用户的结果
+		BOOL bResult = HandleData();  // 此处可以弹框获得用户的结果
 		if (bResult)
 		{
 			SendResultToR0(pOpInfo->m_ulWaitID, TRUE);
@@ -716,65 +722,18 @@ HCURSOR CHookClientDlg::OnQueryDragIcon()
 	return static_cast<HCURSOR>(m_hIcon);
 }
 
-
-
-void CHookClientDlg::OnBnClickedOk()
-{
-	// TODO: Add extra validation here
-
-	//DWORD dwThreadID = 0;
-	//g_bToExitThread = FALSE;
-	////加载驱动
-	//BOOL bRet = LoadDriver(DRIVER_NAME, DRIVER_PATH);
-	//if (!bRet)
-	//{
-	//	MessageBox(_T("加载驱动失败"), _T("Error"), MB_OK);
-	//	return;
-	//}
-
-
-	//gh_Device = OpenDevice();
-	//if (gh_Device == NULL)
-	//{
-	//	MessageBox(_T("打开设备失败"), _T("Error"), MB_OK);
-	//	return;
-	//}
-
-	//g_hReadThread = AfxBeginThread(ReadThreadProc, this);
-
-	//g_hReadThread->SuspendThread();
-	//g_hReadThread->m_bAutoDelete = FALSE;
-	//g_hReadThread->ResumeThread();
-
-
-	//if (g_hReadThread == NULL)
-	//{
-	//	CloseHandle(gh_Device);
-	//	gh_Device = INVALID_HANDLE_VALUE;
-	//	UnloadDriver(DRIVER_NAME);
-	//	return;
-	//}
-
+HANDLE port, completion;
+UINT ConnectR0(LPVOID lpContext) {
 	DWORD requestCount = SCANNER_DEFAULT_REQUEST_COUNT;
 	DWORD threadCount = SCANNER_DEFAULT_THREAD_COUNT;
 	HANDLE threads[SCANNER_MAX_THREAD_COUNT];
 	SCANNER_THREAD_CONTEXT context;
-	HANDLE port, completion;
+	
 	PSCANNER_MESSAGE msg;
 	DWORD threadId;
 	HRESULT hr;
 	DWORD i, j;
 
-	//
-	//  Check how many threads and per thread requests are desired.
-	//
-
-
-	//
-	//  Open a commuication channel to the filter
-	//
-
-	printf("Scanner: Connecting to the filter ...\n");
 	//链接端口
 	hr = FilterConnectCommunicationPort(ScannerPortName,
 		0,
@@ -786,7 +745,7 @@ void CHookClientDlg::OnBnClickedOk()
 	if (IS_ERROR(hr)) {
 
 		printf("ERROR: Connecting to filter port: 0x%08x\n", hr);
-		return;
+		return -1;
 	}
 
 	sendR0Msg(port);
@@ -806,7 +765,7 @@ void CHookClientDlg::OnBnClickedOk()
 
 		printf("ERROR: Creating completion port: %d\n", GetLastError());
 		CloseHandle(port);
-		return;
+		return -1;
 	}
 
 	printf("Scanner: Port = 0x%p Completion = 0x%p\n", port, completion);
@@ -881,9 +840,15 @@ void CHookClientDlg::OnBnClickedOk()
 main_cleanup:
 
 	printf("Scanner:  All done. Result = 0x%08x\n", hr);
-
 	CloseHandle(port);
 	CloseHandle(completion);
+	return 0;
+}
+
+void CHookClientDlg::OnBnClickedOk()
+{
+
+	AfxBeginThread(ConnectR0, this);
 
 	GetDlgItem(IDOK)->EnableWindow(FALSE);
 	GetDlgItem(IDCANCEL)->EnableWindow(TRUE);
@@ -893,29 +858,8 @@ main_cleanup:
 void CHookClientDlg::OnBnClickedCancel()
 {
 	// TODO: Add your control notification handler code here
-	g_bToExitThread = TRUE;
-	if (g_hOverlappedEvent != NULL)
-	{
-		ResetEvent(g_hOverlappedEvent);
-
-		if (g_hReadThread != NULL)
-		{
-			if (WaitForSingleObject(g_hReadThread->m_hThread, 3000) == WAIT_TIMEOUT)
-			{
-				TerminateThread(g_hReadThread->m_hThread, 0);
-			}
-			delete g_hReadThread;
-			g_hReadThread = NULL;
-		}
-
-		CloseHandle(g_hOverlappedEvent);
-		g_hOverlappedEvent = NULL;
-	}
-	if (gh_Device != INVALID_HANDLE_VALUE)
-	{
-		CloseHandle(gh_Device);
-		gh_Device = INVALID_HANDLE_VALUE;
-	}
+	CloseHandle(port);
+	CloseHandle(completion);
 	//UnloadDriver(DRIVER_NAME);
 	GetDlgItem(IDOK)->EnableWindow(TRUE);
 	GetDlgItem(IDCANCEL)->EnableWindow(FALSE);
